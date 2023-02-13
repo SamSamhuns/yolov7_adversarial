@@ -161,7 +161,13 @@ class ConfusionMatrix:
     def matrix(self):
         return self.matrix
 
-    def plot(self, save_dir='', names=()):
+    def tp_fp(self):
+        tp = self.matrix.diagonal()  # true positives
+        fp = self.matrix.sum(1) - tp  # false positives
+        # fn = self.matrix.sum(0) - tp  # false negatives (missed detections)
+        return tp[:-1], fp[:-1]  # remove background class
+
+    def plot(self, save_dir='', names=(), save_name='confusion_matrix.png'):
         try:
             import seaborn as sn
 
@@ -176,7 +182,7 @@ class ConfusionMatrix:
                        yticklabels=names + ['background FN'] if labels else "auto").set_facecolor((1, 1, 1))
             fig.axes[0].set_xlabel('True')
             fig.axes[0].set_ylabel('Predicted')
-            fig.savefig(Path(save_dir) / 'confusion_matrix.png', dpi=250)
+            fig.savefig(Path(save_dir) / save_name, dpi=250)
         except Exception as e:
             pass
 

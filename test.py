@@ -40,7 +40,8 @@ def test(data,
          half_precision=True,
          trace=False,
          is_coco=False,
-         v5_metric=False):
+         v5_metric=False,
+         anno_json=None):
     # Initialize/load model and set device
     training = model is not None
     if training:  # called by train.py
@@ -254,7 +255,6 @@ def test(data,
     # Save JSON
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = './coco/annotations/instances_val2017.json'  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
         print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
         with open(pred_json, 'w') as f:
@@ -273,6 +273,18 @@ def test(data,
             eval.accumulate()
             eval.summarize()
             map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
+
+            # capture eval stats and save to file
+            import io
+            from contextlib import redirect_stdout
+
+            std_out = io.StringIO()
+            with redirect_stdout(std_out):
+                eval.summarize()
+            eval_stats = std_out.getvalue()
+            map_save_path = save_dir / "map_stats.txt"
+            with open(map_save_path, 'w', encoding="utf-8") as fwriter:
+                fwriter.write(eval_stats)
         except Exception as e:
             print(f'pycocotools unable to run: {e}')
 
@@ -309,6 +321,8 @@ if __name__ == '__main__':
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--no-trace', action='store_true', help='don`t trace model')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--anno-json', default="./coco/annotations/instances_val2017.json",
+                        help='path to ref ground truth json annot file')
     opt = parser.parse_args()
     opt.save_json |= opt.data.endswith('coco.yaml')
     opt.data = check_file(opt.data)  # check file
@@ -330,7 +344,8 @@ if __name__ == '__main__':
              save_hybrid=opt.save_hybrid,
              save_conf=opt.save_conf,
              trace=not opt.no_trace,
-             v5_metric=opt.v5_metric
+             v5_metric=opt.v5_metric,
+             anno_json=opt.anno_json
              )
 
     elif opt.task == 'speed':  # speed benchmarks
