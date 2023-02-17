@@ -9,7 +9,7 @@ import json
 import glob
 import random
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Tuple
 from contextlib import redirect_stdout
 
 import tqdm
@@ -25,13 +25,12 @@ from models.experimental import attempt_load
 from utils.metrics import ConfusionMatrix
 from utils.general import non_max_suppression, xyxy2xywh
 from utils.torch_utils import select_device
-from utils.plots import plot_one_box
+from utils.plots import plot_one_box, colors
 
 from adv_patch_gen.utils.config_parser import get_argparser, load_config_object
 from adv_patch_gen.utils.patch import PatchApplier, PatchTransformer
-from adv_patch_gen.utils.common import BColors
+from adv_patch_gen.utils.common import calc_mean_and_std_err, pad_to_square, BColors, IMG_EXTNS
 
-IMG_EXTNS = {".png", ".jpg", ".jpeg"}
 # optionally set seed for repeatability
 SEED = None
 if SEED is not None:
@@ -42,11 +41,10 @@ if SEED is not None:
 torch.backends.cudnn.benchmark = False
 
 
-def eval_coco_metrics(anno_json: str, pred_json: str, txt_save_path: str) -> np.ndarray:
+def eval_coco_metrics(anno_json: str, pred_json: str, txt_save_path: str, w_mode: str = 'a') -> np.ndarray:
     """
     Compare and eval pred json producing coco metrics
     """
-
     anno = COCO(anno_json)  # init annotations api
     pred = anno.loadRes(pred_json)  # init predictions api
     evaluator = COCOeval(anno, pred, 'bbox')
@@ -60,7 +58,7 @@ def eval_coco_metrics(anno_json: str, pred_json: str, txt_save_path: str) -> np.
     with redirect_stdout(std_out):
         evaluator.summarize()
     eval_stats = std_out.getvalue()
-    with open(txt_save_path, 'w', encoding="utf-8") as fwriter:
+    with open(txt_save_path, w_mode, encoding="utf-8") as fwriter:
         fwriter.write(eval_stats)
     return evaluator.stats
 
@@ -88,7 +86,7 @@ class PatchTester:
         lo_area: float = 20**2,
         hi_area: float = 67**2,
         cls_id: Optional[int] = None,
-        class_agnostic: bool = False) -> float:
+        class_agnostic: bool = False) -> Tuple[float, float, float, float]:
         """
         Calculate attack success rate (How many bounding boxes were hidden from the detector)
         for all predictions and for different bbox areas.
@@ -160,6 +158,19 @@ class PatchTester:
 
         return max(asr_small, 0.), max(asr_medium, 0.), max(asr_large, 0.), max(asr_all, 0.)
 
+    @staticmethod
+    def draw_bbox_on_pil_image(bbox: np.ndarray, padded_img: Image, class_list: List[str]) -> Image:
+        """
+        Draw bounding box on a PIL image and return said image after drawing
+        """
+        padded_img_np = np.ascontiguousarray(padded_img)
+        label_2_class = dict(enumerate(class_list))
+        for *xyxy, conf, cls in bbox:
+            c = int(cls)  # integer class
+            label = f'{label_2_class[c]} {conf:.2f}'
+            plot_one_box(xyxy, padded_img_np, label=label, color=colors(c, True), line_thickness=1)
+        return Image.fromarray(padded_img_np)
+
     def _create_coco_image_annot(self, file_path: Path, width: int, height: int, image_id: int) -> dict:
         file_path = file_path.name
         image_annotation = {
@@ -170,20 +181,6 @@ class PatchTester:
         }
         return image_annotation
 
-    def draw_bbox_on_pil_image(self, bbox: np.ndarray, padded_img: Image) -> Image:
-        """
-        Draw bounding box on a PIL image and return said image after drawing
-        """
-        padded_img_np = np.ascontiguousarray(padded_img)
-        label_2_class = dict(enumerate(self.cfg.class_list))
-        colors = [[random.randint(0, 255) for _ in range(3)] for _ in self.cfg.class_list]
-
-        for *xyxy, conf, cls in bbox:
-            c = int(cls)  # integer class
-            label = f'{label_2_class[c]} {conf:.2f}'
-            plot_one_box(xyxy, padded_img_np, label=label, color=colors[int(cls)], line_thickness=1)
-        return Image.fromarray(padded_img_np)
-
     def test(self,
              conf_thresh: float = 0.4,
              nms_thresh: float = 0.4,
@@ -193,7 +190,7 @@ class PatchTester:
              draw_bbox_on_image: bool = True,
              class_agnostic: bool = False,
              cls_id: Optional[int] = None,
-             max_images: int = 100000) -> None:
+             max_images: int = 100000) -> dict:
         """
         Initiate test for properly, randomly and no-patched images
         Args:
@@ -206,6 +203,8 @@ class PatchTester:
             class_agnostic: all classes are teated the same. Use when only evaluating for obj det & not classification
             cls_id: filtering for a specific class for evaluation only
             max_images: max number of images to evaluate from inside imgdir
+        Returns:
+            dict of patch and noise coco_map and asr results
         """
         t0 = time.time()
 
@@ -230,7 +229,7 @@ class PatchTester:
         proper_txt_dir = osp.join(self.cfg.savedir, 'proper_patched/', 'labels/')
         random_img_dir = osp.join(self.cfg.savedir, 'random_patched/', 'images/')
         random_txt_dir = osp.join(self.cfg.savedir, 'random_patched/', 'labels/')
-        jsondir = osp.join(self.cfg.savedir, 'jsons')
+        jsondir = osp.join(self.cfg.savedir, 'results_json')
 
         print(f"Saving all outputs to {self.cfg.savedir}")
         dirs_to_create = [jsondir]
@@ -243,9 +242,13 @@ class PatchTester:
         for directory in dirs_to_create:
             os.makedirs(directory, exist_ok=True)
 
-        # dump cfg json file
-        with open(os.path.join(jsondir, "cfg.json"), 'w', encoding='utf-8') as f_json:
+        # dump cfg json file to self.cfg.savedir
+        with open(osp.join(self.cfg.savedir, "cfg.json"), 'w', encoding='utf-8') as f_json:
             json.dump(self.cfg, f_json, ensure_ascii=False, indent=4)
+
+        # save patch to self.cfg.savedir
+        patch_save_path = osp.join(self.cfg.savedir, self.cfg.patchfile.split('/')[-1])
+        transforms.ToPILImage('RGB')(adv_patch_cpu).save(patch_save_path)
 
         img_paths = glob.glob(osp.join(self.cfg.imgdir, "*"))
         img_paths = sorted(
@@ -277,31 +280,15 @@ class PatchTester:
             txtpath = osp.join(clean_txt_dir, txtname)
             # open image and adjust to yolo input size
             img = Image.open(imgfile).convert('RGB')
-            w, h = img.size
-
-            if w == h:
-                padded_img = img
-            else:
-                dim_to_pad = 1 if w < h else 2
-                if dim_to_pad == 1:
-                    padding = (h - w) / 2
-                    padded_img = Image.new(
-                        'RGB', (h, h), color=(127, 127, 127))
-                    padded_img.paste(img, (int(padding), 0))
-                else:
-                    padding = (w - h) / 2
-                    padded_img = Image.new(
-                        'RGB', (w, w), color=(127, 127, 127))
-                    padded_img.paste(img, (0, int(padding)))
-
+            padded_img = pad_to_square(img)
             padded_img = transforms.Resize(model_in_sz)(padded_img)
-            cleanname = img_name + ".png"
 
             #######################################
-            # generate labels for the patched image
+            # generate labels to use later for patched image
             padded_img_tensor = transforms.ToTensor()(padded_img).unsqueeze(0).to(self.dev)
-            pred = self.model(padded_img_tensor)[0]
-            boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0].detach()
+            with torch.no_grad():
+                pred = self.model(padded_img_tensor)[0]
+                boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
             # if doing targeted class performance check, ignore non target classes
             if cls_id is not None:
                 boxes = boxes[boxes[:, -1] == cls_id]
@@ -339,9 +326,11 @@ class PatchTester:
                 textfile.close()
 
             # save img
+            cleanname = img_name + ".jpg"
             if save_image and save_orig_padded_image:
                 if draw_bbox_on_image:
-                    padded_img_drawn = self.draw_bbox_on_pil_image(all_labels[-1], padded_img)
+                    padded_img_drawn = PatchTester.draw_bbox_on_pil_image(
+                        all_labels[-1], padded_img, self.cfg.class_list)
                     padded_img_drawn.save(osp.join(clean_img_dir, cleanname))
                 else:
                     padded_img.save(osp.join(clean_img_dir, cleanname))
@@ -371,14 +360,15 @@ class PatchTester:
                 p_img = p_img_batch.squeeze(0)
                 p_img_pil = transforms.ToPILImage('RGB')(p_img.cpu())
 
-            properpatchedname = img_name + ".png"
+            properpatchedname = img_name + ".jpg"
             # generate a label file for the image with sticker
-            txtname = properpatchedname.replace('.png', '.txt')
+            txtname = properpatchedname.replace('.jpg', '.txt')
             txtpath = osp.join(proper_txt_dir, txtname)
 
             padded_img_tensor = transforms.ToTensor()(p_img_pil).unsqueeze(0).to(self.dev)
-            pred = self.model(padded_img_tensor)[0]
-            boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0].detach()
+            with torch.no_grad():
+                pred = self.model(padded_img_tensor)[0]
+                boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
             # if doing targeted class performance check, ignore non target classes
             if cls_id is not None:
                 boxes = boxes[boxes[:, -1] == cls_id]
@@ -406,7 +396,8 @@ class PatchTester:
             # save properly patched img
             if save_image:
                 if draw_bbox_on_image:
-                    p_img_pil_drawn = self.draw_bbox_on_pil_image(all_patch_preds[-1], p_img_pil)
+                    p_img_pil_drawn = PatchTester.draw_bbox_on_pil_image(
+                        all_patch_preds[-1], p_img_pil, self.cfg.class_list)
                     p_img_pil_drawn.save(osp.join(proper_img_dir, properpatchedname))
                 else:
                     p_img_pil.save(osp.join(proper_img_dir, properpatchedname))
@@ -421,14 +412,15 @@ class PatchTester:
             p_img = p_img_batch.squeeze(0)
             p_img_pil = transforms.ToPILImage('RGB')(p_img.cpu())
 
-            randompatchedname = img_name + ".png"
+            randompatchedname = img_name + ".jpg"
             # generate a label file for the image with random patch
-            txtname = randompatchedname.replace('.png', '.txt')
+            txtname = randompatchedname.replace('.jpg', '.txt')
             txtpath = osp.join(random_txt_dir, txtname)
 
             padded_img_tensor = transforms.ToTensor()(p_img_pil).unsqueeze(0).to(self.dev)
-            pred = self.model(padded_img_tensor)[0]
-            boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0].detach()
+            with torch.no_grad():
+                pred = self.model(padded_img_tensor)
+                boxes = non_max_suppression(pred, conf_thresh, nms_thresh)[0]
             # if doing targeted class performance check, ignore non target classes
             if cls_id is not None:
                 boxes = boxes[boxes[:, -1] == cls_id]
@@ -456,7 +448,8 @@ class PatchTester:
             # save randomly patched img
             if save_image:
                 if draw_bbox_on_image:
-                    p_img_pil_drawn = self.draw_bbox_on_pil_image(all_noise_preds[-1], p_img_pil)
+                    p_img_pil_drawn = PatchTester.draw_bbox_on_pil_image(
+                        all_noise_preds[-1], p_img_pil, self.cfg.class_list)
                     p_img_pil_drawn.save(osp.join(random_img_dir, randompatchedname))
                 else:
                     p_img_pil.save(osp.join(random_img_dir, randompatchedname))
@@ -510,7 +503,7 @@ class PatchTester:
         eval_coco_metrics(clean_gt_json, clean_json, clean_txt_path)
 
         print(f"{BColors.HEADER}### Metrics for images with correct patches ###{BColors.ENDC}")
-        eval_coco_metrics(clean_gt_json, patch_json, patch_txt_path)
+        coco_map_patch = eval_coco_metrics(clean_gt_json, patch_json, patch_txt_path)
 
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
             all_labels, all_patch_preds, self.cfg.class_list, cls_id=cls_id, class_agnostic=class_agnostic)
@@ -521,10 +514,11 @@ class PatchTester:
             asr_str += f" Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area= large | = {asr_l:.3f}\n"
             asr_str += f" Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area=   all | = {asr_a:.3f}\n"
             print(asr_str)
-            f_patch.write(asr_str)
+            f_patch.write(asr_str + "\n")
+        metrics_patch = {"coco_map": coco_map_patch, "asr": [asr_s, asr_m, asr_l, asr_a]}
 
         print(f"{BColors.HEADER}### Metrics for images with random noise patches ###{BColors.ENDC}")
-        eval_coco_metrics(clean_gt_json, noise_json, noise_txt_path)
+        coco_map_noise = eval_coco_metrics(clean_gt_json, noise_json, noise_txt_path)
 
         asr_s, asr_m, asr_l, asr_a = PatchTester.calc_asr(
             all_labels, all_noise_preds, self.cfg.class_list, cls_id=cls_id, class_agnostic=class_agnostic)
@@ -535,22 +529,80 @@ class PatchTester:
             asr_str += f" Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area= large | = {asr_l:.3f}\n"
             asr_str += f" Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area=   all | = {asr_a:.3f}\n"
             print(asr_str)
-            f_noise.write(asr_str)
+            f_noise.write(asr_str + "\n")
+        metrics_noise = {"coco_map": coco_map_noise, "asr": [asr_s, asr_m, asr_l, asr_a]}
 
         tf = time.time()
         print(f" Time to compute proper patched results = {tf - t0} seconds")
+        return {"patch": metrics_patch, "noise": metrics_noise}
+
+    def study(self,
+              n_experiments: int = 5,
+              conf_thresh: float = 0.4,
+              nms_thresh: float = 0.4,
+              save_txt: bool = False,
+              save_image: bool = False,
+              save_orig_padded_image: bool = True,
+              draw_bbox_on_image: bool = True,
+              class_agnostic: bool = False,
+              cls_id: Optional[int] = None,
+              max_images: int = 100000) -> None:
+        """
+        Generates metrics for n_experiments and calculates the mean metrics along with the ± std error
+        """
+        assert n_experiments > 0
+        patch_metrics, noise_metrics = [], []
+        for n in range(n_experiments):
+            metrics = self.test(
+                conf_thresh, nms_thresh, save_txt, save_image,
+                save_orig_padded_image, draw_bbox_on_image,
+                class_agnostic, cls_id, max_images)
+            patch_metrics.append(list(metrics["patch"]["coco_map"]) + metrics["patch"]["asr"])
+            noise_metrics.append(list(metrics["noise"]["coco_map"]) + metrics["noise"]["asr"])
+        
+        patch_metrics, noise_metrics = np.asarray(patch_metrics), np.asarray(noise_metrics)
+        patch_metrics_with_err = [calc_mean_and_std_err(patch_metrics[:, i]) for i in range(len(patch_metrics[0]))]
+        noise_metrics_with_err = [calc_mean_and_std_err(noise_metrics[:, i]) for i in range(len(noise_metrics[0]))]
+
+        def _metric_fmt(mean_std_err: Tuple[float, float], sdigit: int = 3) -> str:
+            mean, std_err = mean_std_err
+            return f"{round(mean, sdigit)} ± {round(std_err, sdigit)}"
+
+        patch_txt_path = osp.join(self.cfg.savedir, 'patch_map_stats_with_std_err.txt')
+        noise_txt_path = osp.join(self.cfg.savedir, 'noise_map_stats_with_std_err.txt')
+        for txtpath, metrics in zip([patch_txt_path, noise_txt_path], [patch_metrics_with_err, noise_metrics_with_err]):
+            with open(txtpath, 'w', encoding="utf-8") as f_ptr:
+                f_ptr.write(f"Average Precision  (AP) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = {_metric_fmt(metrics[0])}\n")
+                f_ptr.write(f"Average Precision  (AP) @[ IoU=0.50      | area=   all | maxDets=100 ] = {_metric_fmt(metrics[1])}\n")
+                f_ptr.write(f"Average Precision  (AP) @[ IoU=0.75      | area=   all | maxDets=100 ] = {_metric_fmt(metrics[2])}\n")
+                f_ptr.write(f"Average Precision  (AP) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = {_metric_fmt(metrics[3])}\n")
+                f_ptr.write(f"Average Precision  (AP) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = {_metric_fmt(metrics[4])}\n")
+                f_ptr.write(f"Average Precision  (AP) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = {_metric_fmt(metrics[5])}\n")
+                f_ptr.write(f"Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=  1 ] = {_metric_fmt(metrics[6])}\n")
+                f_ptr.write(f"Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets= 10 ] = {_metric_fmt(metrics[7])}\n")
+                f_ptr.write(f"Average Recall     (AR) @[ IoU=0.50:0.95 | area=   all | maxDets=100 ] = {_metric_fmt(metrics[8])}\n")
+                f_ptr.write(f"Average Recall     (AR) @[ IoU=0.50:0.95 | area= small | maxDets=100 ] = {_metric_fmt(metrics[9])}\n")
+                f_ptr.write(f"Average Recall     (AR) @[ IoU=0.50:0.95 | area=medium | maxDets=100 ] = {_metric_fmt(metrics[10])}\n")
+                f_ptr.write(f"Average Recall     (AR) @[ IoU=0.50:0.95 | area= large | maxDets=100 ] = {_metric_fmt(metrics[11])}\n")
+                f_ptr.write(f"Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area= small | = {_metric_fmt(metrics[12])}\n")
+                f_ptr.write(f"Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area=medium | = {_metric_fmt(metrics[13])}\n")
+                f_ptr.write(f"Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area= large | = {_metric_fmt(metrics[14])}\n")
+                f_ptr.write(f"Attack success rate (@conf={conf_thresh}) | class_agnostic={class_agnostic} | area=   all | = {_metric_fmt(metrics[15])}\n")
 
 
 def main():
-    parser = get_argparser()
+    parser = get_argparser(desc="Test patches on a directory with images. Params from argparse take precedence over those from config")
+    parser.add_argument('--dev', type=str,
+                        dest="device", default=None, required=False,
+                        help='Device to use (i.e. cpu, cuda:0, cuda:1). If absent, use "device" from cfg json (default: %(default)s)')
     parser.add_argument('-w', '--weights', type=str,
                         dest="weights", default=None, required=False,
-                        help='Path to yolov5 model wt file. If not provided, the model path from the cfg json is used (default: %(default)s)')
+                        help='Path to yolov5 model wt file. If absent, use "weights_file" model path from cfg json (default: %(default)s)')
     parser.add_argument('-p', '--patchfile', type=str,
                         dest="patchfile", default=None, required=True,
                         help='Path to patch image file for testing (default: %(default)s)')
     parser.add_argument('--id', '--imgdir', type=str,
-                        dest="imgdir", default="../data/visdrone_data/Custom_4Class_labels_vehicles/VisDrone2019-DET-val/images", required=False,
+                        dest="imgdir", default=None, required=True,
                         help='Path to img dir for testing (default: %(default)s)')
     parser.add_argument('--sd', '--savedir', type=str,
                         dest="savedir", default='runs/test_adversarial',
@@ -567,9 +619,13 @@ def main():
     parser.add_argument('--target-class', type=int,
                         dest="target_class", default=None, required=False,
                         help='Target specific class with id for misclassification test (default: %(default)s)')
+    parser.add_argument('--study',
+                        dest="study", action='store_true',
+                        help='Runs test over N times calculating the mean metrics with std error uncertainty')
 
     args = parser.parse_args()
     cfg = load_config_object(args.config)
+    cfg.device = args.device if args.device is not None else cfg.device
     cfg.weights_file = args.weights if args.weights is not None else cfg.weights_file  # check if cfg.weights_file is ignored
     cfg.patchfile = args.patchfile
     cfg.imgdir = args.imgdir
@@ -586,7 +642,8 @@ def main():
 
     print(f"{BColors.OKBLUE} Test Arguments: {args} {BColors.ENDC}")
     tester = PatchTester(cfg)
-    tester.test(save_txt=args.savetxt, save_image=args.saveimg, class_agnostic=args.class_agnostic, cls_id=args.target_class)
+    test_func = tester.study if args.study else tester.test
+    test_func(save_txt=args.savetxt, save_image=args.saveimg, class_agnostic=args.class_agnostic, cls_id=args.target_class)
 
 
 if __name__ == '__main__':

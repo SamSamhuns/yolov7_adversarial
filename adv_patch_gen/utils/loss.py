@@ -25,12 +25,6 @@ class MaxProbExtractor(nn.Module):
         # get values neccesary for transformation
         assert (output.size(-1) == (5 + self.config.n_classes))
 
-        # output_class_scores = output[:, :, 5:5 + self.config.n_classes]  # [batch, -1, n_classes]
-        # # norm probs for object classes to [0, 1]
-        # confs_for_class = torch.nn.Softmax(dim=2)(output_class_scores)
-        # output_objectness = torch.sigmoid(output[:, :, 4]).unsqueeze(-1)  # [batch, -1, 1]
-        # confs_if_object = self.config.loss_target(output_objectness, confs_for_class)
-
         class_confs = output[:, :, 5:5 + self.config.n_classes]  # [batch, -1, n_classes]
         objectness_score = output[:, :, 4]  # [batch, -1, 5 + num_cls] -> [batch, -1], no need to run sigmoid here
 
